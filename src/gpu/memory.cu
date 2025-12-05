@@ -113,9 +113,10 @@ uint32* cuMM::resizeLits(const size_t& min_lits)
 bool cuMM::allocHist(cuHist& cuhist, const bool& proofEnabled)
 {
 	assert(inf.maxDualVars == V2L(inf.maxVar + 1ULL));
+	const size_t varsize = inf.maxVar + 1;
 	const size_t segBytes = inf.maxDualVars * HC_SREFSIZE;
 	const size_t histBytes = inf.maxDualVars * HC_VARSIZE;
-	const size_t varsBytes = (inf.maxVar + 1) * HC_VARSIZE;
+	const size_t varsBytes = varsize * HC_VARSIZE;
 	size_t min_cap = segBytes + histBytes + varsBytes;
 	if (proofEnabled) 
 		min_cap += inf.maxDualVars;
@@ -148,8 +149,8 @@ bool cuMM::allocVars(VARS*& vars, const size_t& resolvedCap)
 	assert(vars == NULL);
 	assert(resolvedCap && resolvedCap < UINT32_MAX);
 	vars = new VARS();
-	const size_t uintVec_sz = inf.maxVar * HC_VARSIZE;
 	const size_t varsize = inf.maxVar + 1;
+	const size_t uintVec_sz = varsize * HC_VARSIZE;
 	const size_t scores_sz = varsize * HC_VARSIZE;
 	const size_t resolved_sz = resolvedCap * HC_VARSIZE;
 	size_t min_cap = HC_VECSIZE * 3;                             // headers: (elected + units + resolved) 
@@ -165,11 +166,11 @@ bool cuMM::allocVars(VARS*& vars, const size_t& resolvedCap)
 	uint32* uintPtr = (uint32*)ea;
 	vars->electedData = uintPtr;
 	vars->electedSize = (uint32*)((addr_t)vars->elected + sizeof(uint32*));
-	vars->elected->alloc(uintPtr, inf.maxVar), uintPtr += inf.maxVar;
+	vars->elected->alloc(uintPtr, varsize), uintPtr += varsize;
 	vars->unitsData = uintPtr;
 	vars->unitsSize = (uint32*)((addr_t)vars->units + sizeof(uint32*));
-	vars->units->alloc(uintPtr, inf.maxVar), uintPtr += inf.maxVar;
-	vars->eligible = uintPtr, uintPtr += inf.maxVar;
+	vars->units->alloc(uintPtr, varsize), uintPtr += varsize;
+	vars->eligible = uintPtr, uintPtr += varsize;
 	vars->scores = uintPtr, uintPtr += varsize;
 	vars->resolved->alloc(uintPtr, uint32(resolvedCap)), uintPtr += resolvedCap;
 	Byte* bytePtr = (Byte*)uintPtr;
@@ -190,8 +191,9 @@ bool cuMM::allocPinned(VARS* vars, cuHist& cuhist)
 {
 	assert(vars);
 	assert(inf.maxDualVars == V2L(inf.maxVar + 1ULL));
-	const size_t elimBytes = inf.maxVar + 1;
-	const size_t unitBytes = inf.maxVar * HC_VARSIZE;
+	const size_t varsize = inf.maxVar + 1;
+	const size_t elimBytes = varsize * sizeof(Byte);
+	const size_t unitBytes = varsize * HC_VARSIZE;
 	const size_t histBytes = inf.maxDualVars * HC_VARSIZE;
 	size_t min_cap = HC_CNFSIZE + elimBytes + unitBytes + histBytes;
 	assert(min_cap);
