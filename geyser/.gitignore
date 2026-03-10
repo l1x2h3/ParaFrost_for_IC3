@@ -1,0 +1,31 @@
+# Exclude the whole IDE specific stuff
+.idea/
+
+# CMake build output
+cmake-build-*/
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+
+# Compiled object files
+*.o
+*.obj
+
+# Executables
+run-geyser
+test
+
+# Testing benchmarks
+benchmarks/
+
+# Temporary files
+*.tmp
+*.log
+*~
+
+# Preprocessing temporary files
+ic3_preprocess.cnf
+preprocess_output.txt

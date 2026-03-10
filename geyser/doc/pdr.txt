@@ -1,0 +1,432 @@
+We base our implementation mainly on Efficient implementation of property
+directed reachability (Een, Mischenko, Brayton) and Comparing different
+variants of the IC3 algorithm for hardware model checking (Griggio, Roveri).
+We have also taken a look at the source code of IC3Ref (Bradley), although our
+overall design is much closer to Een et al. than to Bradley. Note that the
+method of generalizing predecessors was taken from Incremental formal
+verification of hardware (Chockler et al.), and the approach to inductive
+generalization of blocked cubes from Een et al., although we don't use their
+(in our opinion relatively minor) optimization with infinite frame for truly
+(i.e. not relatively) inductive cubes.
+
+Given a transition system S = <X, Y, I(X), T(X, Y, X')> and an error formula
+E(X, Y) [describing that input Y in state X is bad; note that the error formula
+might depend on Y in Aiger], we store a trace
+
+  F_0, F_1, ..., F_k
+
+where each F_i is a set of cubes blocked at step i, but not at step i + 1. Note
+that we can reconstruct the original meaning of the trace
+
+  R_0, R_1, ..., R_k
+
+in IC3 by
+
+  R_i = -F_i /\ -F_{i + 1} /\ ... /\ -F_k
+  (and R_0 = I).
+
+The trace is implemented as a vector storing F_0, ..., F_k in order. We also
+store activation variables for each frame in vector Act, and the solver is
+informed about the contents of the frames as follows: Whenever we add a new
+cube c to F_i, the clause -c_i (-c activated by Act_i) is added to the solver.
+We can then solve with R_i activated by assuming literals Act_i through Act_k.
+
+Originally, we tried to do everything using a single solver, so we had
+activation literals ActT and ActE and solved with, say, T in the formula by
+activating ActT. This turned out to be too slow. We guess that "hiding" T
+behind an activation literal prohibits many potential simplifications that
+the solver can do while preprocessing the formula. As such, we use three
+different solvers: trans_solver, which is always loaded with T, error_solver,
+which contains E, and basic_solver, which contains neither. Each solver has
+its own copy of the trace, as described above.
+
+The pseudocode is given below. Note several conventions:
+  * |X| is the size of the collection X
+  * for a given formula f, f' is f.map( fun lit => lit.prime() )
+  * -f is the negation of f
+
+
+pdr() -> result:
+
+  # Create (empty) F_0 at the start of F (i.e. F = [F_0]).
+  push_frame()
+
+  # Note that k is |F| - 1.
+
+  # Fill the solvers by the transition system's CNF specification. Note that
+  # the first frame is handled separately - F[ 0 ] is kept empty and Act[ 0 ]
+  # activates the initial formula.
+
+  initial = I.activated_by( Act[ 0 ] )
+
+  basic_solver.add_formula( init )
+
+  trans_solver.add_formula( init )
+  trans_solver.add_formula( T )
+
+  error_solver.add_formula( init )
+  error_solver.add_formula( E )
+
+  loop:
+
+    # This implements SAT( R[ k ] /\ E ) query.
+
+    while error_solver.assume( Act[ k ] ).is_sat():
+      s = error_solver.get_model().filter( is_state_variable )
+
+      if solve_obligation( < s, k > ) == counterexample:
+
+        # To truly extract a counterexample, we need some additional
+        # bookkeeping. This is performed by the CTI pool in the real code,
+        # which is inspired by the state pool in IC3Ref.
+
+        return counterexample
+
+    push_frame() # Create (empty) F_{k + 1}.
+
+    if propagate() == invariant_found:
+      return ok
+
+
+solve_obligation( < s, k' > : cube * int ) -> result:
+  assert 0 <= k' <= k
+
+  # Minimum priority queue of proof obligations, ordered by frame.
+  Q = minimum_queue[ cube * int ]()
+  Q.add( < s, k' > )
+
+  while ( |Q| > 0 ):
+    < c, i > = Q.pop_minimum()
+
+    if i == 0:
+      return counterexample # We have backtraced to an initial state!
+
+    # If we have already seen this cube (or a more general one) at this level,
+    # do not return to it.
+
+    if is_already_blocked( < c, i > ):
+      continue
+
+    # Note that at this point, c is guaranteed not to intersect with the
+    # initial states.
+
+    # This implements SAT( R[ i - 1 ] /\ -c /\ T /\ c' ) query. Note that
+    # constrain adds the clause -c (but only a single clause) into the SAT
+    # solver's context with the same lifetime as assumed literals (i.e. the
+    # clause will disappear once the query is finished). This API is provided
+    # by CaDiCaL.
+
+    if trans_solver
+         .constrain( -c )
+         .assume( literals( c' ), Act[ i - 1 ], ..., Act[ k ] )
+         .is_sat():
+
+      # There is a predecessor of c in R[ i - 1 ]. Instead of continuing with
+      # a full cube that would block a single state, try to shorten the cube
+      # of the predecessor (i.e. the model of the last sat call projected to
+      # the unprimed state variables) to a cube d that has the property that
+      # every state in d can make a step to c (under the same primary input
+      # values as the full cube predecessor).
+
+      d = generalize_predecessor( c )
+
+      # Focus now on blocking d one step closer to the initial states.
+      Q.add( < d, i - 1 > )
+
+      # After that is done, return back to c, try a different predecessor.
+      Q.add( < c, i > )
+
+    else:
+
+      # There is no predecessor of any state in c in R[ i - 1 ]. We could block
+      # c at i now, but it is better to shorten (generalize) the cube first
+      # Note that even though c might at this point contain more than a single
+      # state thanks to generalization of predecessors along the way, this is
+      # not the case for proof obligations at the boundary, i.e. with i = k.
+      #
+      # Our generalization (taken from Een et al.) might even realize that the
+      # cube might be blocked at a later frame already, thus saving some time
+      # by not rediscovering the same fact later. Hence, the generalization
+      # procedure returns not just a subcube d of c, but a level j >= i such
+      # that no state in d is reachable in at most j steps.
+
+      < d, j > = generalize_inductive( c, i )
+      add_blocked_at( d, j )
+
+      # If we had to block c at some level i and succeeded, it might make sense
+      # to block it even later in the trace. As such, we repush the obligation
+      # to a higher level. This is a heuristic that works well in many
+      # situations, apparently.
+
+      if i < k:
+        Q.add( < c, i + 1 > )
+
+  return still_safe
+
+
+push_frame():
+  assert |F| = |Act|
+
+  F.push_back()
+  Act.push_back( make_variable() )
+
+
+propagate() -> propagate_result:
+  for i in 1 .. ( k - 1 ):
+    for c in F[ i ]:
+
+      # We push a blocked cube c from F[ i ] to F[ i + 1 ] if it is still
+      # blocked in that frame (that is, if c has no predecessors in F[ i ],
+      # or, in Bradley's terminology, if c is inductive relative to F[ i ]).
+      # This holds iff SAT( R[ i ] /\ -c /\ T /\ c' ) is false.
+
+      if not trans_solver
+               .constrain( -c )
+               .assume( literals( c' ), Act[ i ], ..., Act[ k ] )
+               .is_sat():
+
+        # Beware here that add_blocked_at will actually remove the cube c
+        # from F[ i ] as subsumed (by itself). Depending on implementation,
+        # this can, e.g., reorder F[ i ] or do all sort of things with it,
+        # and the implementation of iteration through F[ i ] must react to
+        # this.
+
+        add_blocked_at( c, i + 1 )
+
+    # After propagating the cubes from F[ i ], it might happen that all the
+    # cubes that held in F[ i ] also hold in F[ i + 1 ], i.e. every cube
+    # in F[ i ] was added to F[ i + 1 ] and by subsumption removed from F[ i ],
+    # leaving F[ i ] empty. This indicates that R[ i ] = R[ i + 1 ], i.e. we
+    # have found our inductive invariant.
+
+    if |F[ i ]| = 0:
+      return invariant_found
+
+  return invariant_not_found
+
+
+is_already_blocked( < c, i > : cube * int ) -> bool:
+  assert 1 <= i
+
+  # If we are actually looking at a cube that can be blocked at a higher level
+  # than what our frames hold, it surely isn't blocked. This can be caused by
+  # raising of the level in inductive generalization.
+
+  if i > k:
+    return false
+
+  # We want to check whether R[ i ] |= -c. If there is a cube d between F[ i ]
+  # and F[ k ] that subsumes c (which guarantees c |= d), the result is
+  # immediate (since R[ i ] |= -d, -d |= -c).
+
+  for j in i .. k:
+    for d in F[ j ]:
+      if subsumes( d, c ):
+        return true
+
+  # Only if this fails, we perform a more expensive SAT query
+  # SAT( R[ i ] /\ c ). This formula is satisfiable if and only if the
+  # entailment R[ i ] |= -c fails.
+
+  return not basic_solver.assume( literals( c ), Act[ i ], ..., Act[ k ] ).is_sat()
+
+
+add_blocked_at( c : cube, i : int ):
+  assert 1 <= i
+
+  # It is possible that i > k, due to generalization. In that case, we add it
+  # to the highest frame instead of the frame it could go to (and which is
+  # still missing). It will get propagated up, eventually.
+
+  m = max( i, k )
+
+  # First add the cube c to F[ m ]. However, our trace can at this point
+  # contain "strictly weaker information" which is easy to detect and remove:
+  # If we already have a cube d in some F[ j ] (j <= m) that is subsumed by c,
+  # there is no reason to keep it, since c blocks at least as many states as d.
+
+  for j in 1 .. m:
+    for d in F[ j ]:
+      if subsumes( c, d ):
+        F[ j ].remove( d )
+
+  F[ m ].push_cube( c )
+
+  # Now add the cube also to the solvers. We cannot remove subsumed clauses in
+  # the solver, but the solver may actually do something about them in its
+  # internals (and we could reset the solver once every X SAT queries).
+
+  clause = ( -c ).activated_by( Act[ m ] )
+
+  basic_solver.add_clause( clause )
+  trans_solver.add_clause( clause )
+  error_solver.add_clause( clause )
+
+
+subsumes( c : cube, d : cube ) -> bool:
+
+  # A cube c subsumes d if literals( c ) is a subset of literals( d ). For
+  # example, A /\ -B subsumes A /\ -B /\ C. Note that if c subsumes d, we have
+  # d |= c. Beware of the difference between this and the more common
+  # subsumption of clauses c and d, which is defined in the same way (e.g.
+  # A \/ -B subsumes A \/ -B \/ C), but guarantees c |= d instead!
+
+  if |literals( c )| > |literals( d )|:
+    return false
+
+  for l in literals( c ):
+    if not literals( d ).contains( l ):
+      return false
+
+  return true
+
+
+generalize_predecessor( s : cube ) -> cube:
+  assert s.all( fun lit => var( lit ).is_state_variable )
+
+  # We found that s is a cube satisfying R[ i - 1 ] /\ -s /\ T /\ s' for some
+  # i, now we want to get a predecessor cube d to s. While just fetching all
+  # the state variables from the model of the formula above would give us a
+  # cube representing precisely one predecessor d in R[ i - 1 ], we want to
+  # generalize to more than a single state by returning a cube that does not
+  # contain all state variables, ideally.
+
+  # Note that this function must be called before a different sat call is made.
+
+  ins = trans_solver.get_model().filter( is_input_variable )
+  p = trans_solver.get_model().filter( is_state_variable )
+
+  # Query SAT( T /\ ins /\ p /\ -s' ). We know this is unsatisfiable, since
+  # the transition relation is "functional" in the sense that there is exactly
+  # one transition from any given state under a specific input valuation. In
+  # this specific situation, we know that p leads to s under ins, hence it
+  # cannot lead to any state in -s.
+
+  b = trans_solver.constrain( -s' ).assume( ins, p ).is_sat()
+  assert not b
+
+  # Since the query is not satisfiable, an unsat core is available. This core
+  # includes a subcube q of p with the property that T /\ ins /\ q /\ -s' is
+  # still unsatisfiable, i.e. T /\ ins /\ q |= s' - all states in q lead to
+  # s under ins. We have no guarantee that q is a proper subcube of p, but we
+  # hope that in many practical situations, it may be (significantly) smaller.
+
+  return trans_solver.core().filter( fun lit => var( lit ).is_state_variable )
+
+
+generalize_inductive( c : cube, i : int ) -> cube * int:
+  assert 1 <= i <= k
+
+  # The formula R[ i - 1 ] /\ -c /\ T /\ c' was found to be unsatisfiable in
+  # solve_obligation. That is, there is no predecessor state of any state of
+  # c in the frame R[ i - 1 ]. Per Bradley's terminology, the clause -c was
+  # found to be inductive relative to R[ i - 1 ] (in general, P is inductive
+  # if both I |= P [I /\ -P is unsatisfiable] and P /\ T |= P' [P /\ T /\ -P'
+  # is unsatisfiable], and inductive relative to Q if again I |= P and
+  # Q /\ P /\ T |= P' [Q /\ P /\ T /\ -P' is unsatisfiable]).
+  #
+  # We could now add c to F[ i ], but we want to yet again generalize the cube
+  # so that it contains more states by dropping some literals from it. Further,
+  # we may actually find that -c is inductive relative to even some further
+  # frame.
+
+  # The first step is to use the information we have available in the unsat
+  # core resulting from the previous SAT query R[ i - 1 ] /\ -c /\ T /\ c'.
+
+  < d, j > = generalize_from_core( c, i )
+
+  # At this point, we have a (hopefully proper) subclause d of c such that d
+  # is inductive relative to R[ j ]. That is
+  #   * I /\ d is unsatisfiable,
+  #   * R[ j ] /\ -d /\ T /\ d' is unsatisfiable.
+  # We now try to generalize it further by removing even those literals that
+  # might have been in the core (note that the core is a "best effort"
+  # information, there is no guarantee about its quality or even minimality).
+  #
+  # To that end, we try to drop each literal that has so far remained in d.
+  # If it causes any of the two aforementioned formulas to become satisfiable,
+  # we simply put it back.
+
+  # Beware that this is an iteration through a changing collection, the code
+  # must solve this.
+
+  for lit in literals( d ):
+    d.remove_literal( lit )
+
+    intersects_initial =
+      basic_solver.assume( Act[ 0 ], literals( d ) ).is_sat()
+    has_predecessor =
+      trans_solver.constrain( -d )
+            .assume( literals( d ), Act[ j ], ..., Act[ k ] )
+
+    if intersects_initial or has_predecessor:
+      d.add_literal( lit )
+    else:
+      # We know that R[ j ] /\ -d /\ T /\ d' is unsatisfiable, we can again
+      # generalize from the core here and drop more than just lit. And possibly
+      # even raise the level.
+
+      < d, j > = generalize_from_core( d, j )
+
+  # Now for the final touch. We will try to increase the level of d yet again,
+  # this time going beyond the information we were able to extract from the
+  # core (just as we did for the cube). We will simply try to increase j until
+  # d is no longer inductive relative to it (or until we reach k).
+
+  while j < k && trans_solver
+                   .constrain( -d )
+                   .assume( literals( d ), Act[ j + 1 ], ..., Act[ k ] ):
+    j = j + 1
+
+  # We return the level at which to block d, which is one more than the level
+  # to which it is relative inductive.
+
+  return < d, j + 1 >
+
+
+generalize_from_core( c : cube, i : int ) -> cube * int:
+  assert 1 <= i <= k
+
+  # In fact, let's first use the unsat core of the last query to cheaply raise
+  # the level. Since the query was SAT( R[ i - 1 ] /\ -c /\ T /\ c' ), we had
+  # to supply activation literals for F[ i - 1 ], F[ i ], ..., F[ k ]. It may
+  # happen that not all of them were actually needed for the unsatisfiability
+  # result. If the smallest one that was needed (i.e. is in the core) is j, we
+  # actually found out that R[ j ] /\ -c /\ T /\ c' is unsatisfiable (note that
+  # even if there are further "gaps" in the activation literal sequence - say
+  # j was used but j + 1 wasn't, this doesn't actually tell us anything useful,
+  # so we really need to look for the smallest such literal).
+  #
+  # It may also happen that none of Act[ i - 1 ], ..., Act[ k ] are in the
+  # core. In this case, the clause -c is truly, not just relatively, inductive.
+  # We may in this case safely add it to any frame whatsoever, and it will get
+  # propagated to the last frame in each propagation. The best place to add it
+  # to is, unsurprisingly, F[ k ].
+
+  j = k
+
+  for jj in ( i - 1 ) .. k:
+    if trans_solver.core().contains( jj ):
+      j = jj
+      break
+
+  # We can now use the core to drop some literals from c. If we look at the
+  # subcube d of c such that d consists of exactly those literals of c that
+  # are in the core, we see that R[ i - 1 ] /\ -d /\ T /\ d', and hence by the
+  # previous also R[ j ] /\ -d /\ T /\ d', must still be unsatisfiable.
+  # However, while our obligation solving algorithm guarantees that I |= -c,
+  # this may not hold for an arbitrary subcube of c (and as such, our d might
+  # not really be inductive relative to R[ j ] anymore). Hence, we try to add
+  # literals of c back to d until we get a supercube of the original core that
+  # also guarantees disjointness with the initial states.
+
+  if basic_solver.assume( Act[ 0 ], literals( d ) ).is_sat():
+    for lit in literals( c ):
+      d.add_literal( lit )
+
+      if not basic_solver.assume( Act[ 0 ], literals( d ) ).is_sat():
+        break
+
+  # We return a cube d such that -d is inductive relative to j,
+
+  return < d, j >
