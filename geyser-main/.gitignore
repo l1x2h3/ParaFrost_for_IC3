@@ -1,0 +1,8 @@
+# Exclude the whole IDE specific stuff
+.idea/
+
+# CMake build output
+cmake-build-*/
+
+# Testing benchmarks
+benchmarks/
