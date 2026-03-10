@@ -1,0 +1,563 @@
+Our implementation of CAR mostly follows the paper Accelerate safety model
+checking based on complementary approximate reachability (Zhang et al.). We
+have also used the code of SimpleCAR, the tool by the authors of the
+aforementioned paper, as an additional source to help us understand the
+algorithm. We implement only the forward direction of CAR with PDR-like
+propagation, partial model and MUC heuristics, but without the dead state
+elimination heuristics.
+
+The reason for not implementing backward CAR is that even though pure backward
+CAR is (according to authors' evaluation) more efficient than pure forward CAR,
+the difference more or less disappears once the heuristics are present, and
+partial model heuristic doesn't work in the backward mode (since the reversed
+transition relation is no longer functional in inputs and state variables).
+Further, the dead state heuristic seems to bring modest performance gains and
+as such is, in our opinion, not worth the problems with implementation.
+
+Note that we make one large theoretical change, a similar to the one made by
+Een et al. in regard to IC3: instead of asserting that each frame of the trace
+contains only safe states and looking at transitions from the last frame to
+the set of "eventually unsafe" states (i.e. members of the underapproximate
+sequence B), we allow the last frame to have a non-empty intersection with B
+and look at potential counterexample path starting from a state in this
+intersection.
+
+Given a transition system S = <X, Y, I(X), T(X, Y, X')> and an error formula
+E(X, Y), we store a trace
+
+  F_0, F_1, ..., F_k
+
+where each F_i is a set of cubes blocked at step i. Unlike PDR, this trace is
+not cumulative, so if c is in F_i, we only know that no state described by c
+is reachable in exactly i steps from I. We store F in a vector, and we further
+store activation variables for each frame in vector Act.
+
+We use the notation R_i to mean -F_i. Similarly to PDR, the solvers are
+informed about the contents of the trace so that adding c to F_i also adds the
+clause -c activated by Act_i to the solvers. Asserting R_i in the solver thus
+amounts to assuming Act_i.
+
+As in PDR, the first frame is semantically equal to the set of initial states.
+Implementation-wise, F_0 exists only virtually and is kept empty throughout
+the algorithm (i.e. no initial states are blocked, because we know they are
+reachable - in 0 steps).
+
+We similarly store a cotrace
+
+  B_0, B_1, ..., B_l
+
+where each B_i is a set of cubes with the property that each state described by
+c in B_i has a path of length precisely i to some bad state b in B_0 = E. More
+precisely, every state s in B_0 has the property that there exist inputs y with
+E(s, y) true (B_0 are precisely the "bad states" as describable by Aiger). Note
+that each B_i is only an underapproximation of such "i-generalized bad states",
+except for B_0, which contains precisely the bad states. However, the
+implementation doesn't actually store B_0 explicitly (there can, of course, be
+extremely many bad states), but instead stores it lazily, adding a cube there
+whenever we find out that F_k /\ E is satisfiable.
+
+The inductiveness check requires special care (that is, clausification of
+disjunctions) and cannot be efficiently handled by the incremental API. As
+such, the check uses a special ad hoc solver initialized anew each time we
+perform the check after a propagation phase.
+
+The pseudocode follows. It is at times heavily inspired by our implementation
+of PDR and uses the same conventions.
+
+
+car() -> result:
+
+  # Create (empty) F_0 at the start of F (i.e. F = [F_0]).
+  push_frame()
+
+  # Create (empty) B_0 at the start of B.
+  push_coframe()
+
+  # Note that k is |F| - 1 and l is |B| - 1.
+
+  initial = I.activated_by( Act[ 0 ] )
+
+  basic_solver.add_formula( init )
+
+  trans_solver.add_formula( init )
+  trans_solver.add_formula( T )
+
+  error_solver.add_formula( init )
+  error_solver.add_formula( E )
+
+  loop:
+
+    # The function enumerate_bad_states() is a generator which returns states
+    # (i.e. state variable cubes) s with the property that s lies both in R_k
+    # (is not blocked by any cube in F[ k ]) and in B_j for some 0 <= j <= l.
+    # Once no such state exists, the enumeration ends.
+
+    for < s, j > in enumerate_bad_states():
+
+      if solve_obligation( < s, k, j > ) == counterexample:
+
+        # Similarly to PDR, we need some additional bookkeeping to actually
+        # reconstruct the counterexample path. This is somewhat harder than in
+        # PDR, however, since s need not be a final state of the path (it might
+        # lie in B_j with j < l, in which case the counterexample goes from
+        # some initial state through s to some bad state in B_0).
+
+        return counterexample
+
+    push_frame() # Create (empty) F_{k + 1}.
+
+    if propagate() == invariant_found:
+      return ok
+
+    # Since the trace is not cumulative, we are no longer guaranteed that
+    # propagation finds out that our trace is already inductive. Thus, we need
+    # to check it manually. We want to check whether there exists a frame R_i
+    # with 1 <= i <= k which is (when taken as a set of states) a subset of the
+    # union of all the preceding frames R_0, ..., R_{i - 1}. If this is the
+    # case, we have found the inductive invariant S, which is the union of R_0
+    # up to R_{i - 1}. This is indeed an inductive invariant, since:
+    #
+    #   1. S contains I = R_0 by construction;
+    #   2. S is closed under the transition relation: Every state s in S lies
+    #      in some R_j, 0 <= j < i, hence every successor t of s lies in
+    #      R_{j + 1} with j + 1 <= i. If j + 1 < i, we immediately have t in S,
+    #      otherwise t lies in R_i, in which case t also lies in S by the
+    #      assumption that R_i is a subset of F_0 union ... union R_{i - 1}.
+    #
+    # This guarantees that S overapproximates the set of all states reachable
+    # from the initial ones. Further, we know that no state in S is an error
+    # state, since we maintain the invariant that all frames except possibly
+    # the last one contain only safe states, and S is a union of such safe
+    # frames.
+
+    if is_inductive()
+      return ok
+
+
+enumerate_bad_states() -> list[cube * int]:
+
+  # We want to generate states satisfying R_k /\ B_j for some j. The order in
+  # which we consider the cotrace might make a difference. SimpleCAR has a
+  # switch that controls whether it is considered from the beginning (i.e. from
+  # B_0 = E) or from the end, and defaults to the latter. Let's just go with
+  # that choice, but it might make sense to measure the difference.
+
+  # First, try all the cubes that are have already been found to lead to
+  # "truly" bad states (i.e. to E). The first of those certainly lies in R_k,
+  # since at this point, R_k is empty (contains all states). As its proof
+  # obligation gets solved, it might lead to the second (or any further)
+  # cube d being blocked at k (i.e. R_k /\ d is no longer satisfiable). We
+  # should make sure to filter those out.
+
+  for j in l .. 0:
+    for c in B[ j ]:
+      if basic_solver.assume( Act[ k ], literals( c ) ).is_sat():
+        yield < c, j >
+
+  # After trying out all the cubes we have already stored in the cotrace, we
+  # extend B_0 by other states that so far still satisfy R_k /\ E and yield
+  # them as well. Note that B_0 represents bad states lazily and the states
+  # satisfying R_k /\ E are a certain subset of bad states.
+
+  while error_solver.assume( Act[ k ] ).is_sat():
+
+    s = error_solver.get_model().filter( is_state_variable )
+    add_reaching_at( s, 0 )
+
+    yield < s, 0 >
+
+
+solve_obligation( < s, k', j' > : cube * int * int ) -> result:
+  assert 0 <= k' <= k
+  assert 0 <= j' <= l
+
+  # Both the paper and SimpleCAR use a recursive blocking scheme here, which
+  # amounts to putting proof obligations on a stack. This is also true for the
+  # "textbook" (i.e. pseudocode) description of PDR, but it was shown by Een et
+  # al. that using a priority queue is generally more efficient. We see no
+  # reason why this should be different for CAR and adapt that method also for
+  # our implementation (although it might make sense to compare both methods
+  # in our implementation explicitly).
+
+  # Minimum priority queue of proof obligations, ordered by frame. The number
+  # j' describes in which coframe the state s lies, which is needed so that we
+  # know where to add found predecessors. It might make sense to experiment
+  # with j as an additional ordering heuristic in the minimum queue, but at the
+  # moment, we have no idea how it might impact performance.
+
+  Q = minimum_queue[ cube * int * int ]()
+  Q.add( < s, k', j' > )
+
+  while ( |Q| > 0 ):
+    < c, i, j > = Q.pop_minimum()
+
+    if i == 0:
+      return counterexample
+
+    if is_already_blocked( < c, i > ):
+      continue
+
+    # Note that at this point, c is guaranteed not to intersect with the
+    # initial states.
+
+    # Is R_{i - 1} /\ T /\ c' satisfiable? Note the lack of -c, in contrast
+    # to PDR. We can no longer speak about relatively inductive clauses.
+
+    if trans_solver.assume( Act[ i - 1 ], literals( c' ) ).is_sat():
+
+      # There is indeed a predecessor of c in R_{i - 1}. We employ the same
+      # generalization technique here as in PDR. In addition, we know that we
+      # can extend the cotrace by the resulting predecessor cube.
+
+      d = generalize_predecessor( c )
+
+      add_reaching_at( d, j + 1 )
+
+      Q.add( < d, i - 1, j + 1 > )
+      Q.add( < c, i, j > )
+
+    else:
+
+      # There is no predecessor of c in R_{i - 1}. We generalize c to a shorter
+      # cube.
+
+      d = generalize_blocked( c, i )
+      add_blocked_at( d, i )
+
+      # This, too, is a heuristic from PDR. It makes sense to try it, but it
+      # may not work as well here as in there.
+
+      if i < k:
+        Q.add( < c, i + 1, j > )
+
+    return still_safe
+
+
+push_frame():
+  assert |F| = |Act|
+
+  F.push_back()
+  Act.push_back( make_variable() )
+
+
+push_coframe():
+  B.push_back()
+
+
+propagate() -> propagate_result:
+
+  # Propagation works similarly as in PDR: we go from F_1 to F_{k - 1} and push
+  # a cube one frame forward if it still holds in that frame. Since the trace
+  # isn't cumulative however, we don't remove it from the current frame when
+  # pushing, and as a result, we cannot determine that we have inductive
+  # invariant by checking emptiness of a frame. Instead, we have to track
+  # whether we have indeed pushed every cube from F_i to F_{i + 1}.
+
+  for i in 1 .. ( k - 1 ):
+    pushed_all = true
+
+    for c in F[ i ]:
+
+      # The fact that cube c is in F[ i ] means that every state s reachable
+      # from the initial states in precisely i steps satisfies -c. If we
+      # further know that no state in c has predecessors in R_i (i.e. the
+      # formula R_i /\ T /\ c' is unsatisfiable), it holds that every state
+      # reachable in precisely i + 1 steps must also satisfy -c (if we had
+      # a state s in R_{i + 1} satisfying c, there would be a predecessor t
+      # of s in R_i such that t /\ s' would be a model of the formula). Hence,
+      # we can safely add c as blocked in frame i + 1.
+
+      if trans_solver.assume( Act[ i ], literals( c' ) ).is_sat():
+        pushed_all = false
+      else:
+        # CAR seems to add only those literals in c that appeared in the unsat
+        # core, but SimpleCAR doesn't seem to really do this?
+
+        add_blocked_at( c, i + 1 )
+
+    # If we pushed all cubes blocked in F[ i ] to F[ i + 1 ], the set F_i has
+    # become a subset of F_{i + 1}. Equivalently, we have R_{i + 1} as a subset
+    # of R_i, when considering both sets as sets of states. This, however,
+    # guarantees that R_{i + 1} is a subset of the union of R_0, ..., R_i, and
+    # by our discussion above, the union of R_0 up to R_i is our sought
+    # inductive invariant.
+
+    if pushed_all:
+      return invariant_found
+
+  return invariant_not_found
+
+
+is_inductive() -> bool:
+
+  # As previously mentioned, we want to check whether there exists some frame
+  # R_i (1 <= i <= k) such that the states in R_i form a subset of the states
+  # in the union of R_0 up to R_{i - 1}. This holds if and only if there is
+  # some i (1 <= i <= k) such R_i |= R_0 \/ R_1 \/ ... \/ R_{i - 1}, i.e. iff
+  # the formula R_i /\ -(R_0 \/ R_1 \/ ... \/ R_{i - 1}) =
+  # R_i /\ -R_0 /\ ... /\ -R_{i - 1} is unsatisfiable.
+  #
+  # The problem here is that since frames are CNF formulas, each of
+  # -R_0, ..., -R_{i - 1} is a formula in DNF (each -R_j is precisely the
+  # disjunction of all the cubes blocked in F[ j ]). This is not checkable by
+  # the incremental CNF-based API of the solver without polluting it by a lot
+  # of clauses that won't ever be used again. As such, we use a special solver
+  # created here just for the purposes of this check.
+
+  checker = make_solver();
+
+  # We want to check the following sequence of formulas:
+  #   * R_1 /\ -R_0
+  #   * R_2 /\ -R_0 /\ -R_1
+  #   * R_3 /\ -R_0 /\ -R_1 /\ -R_2
+  #   ...
+  #   * R_k /\ -R_0 /\ ... /\ -R_{k - 1}
+  #
+  # The negations are shared between the subsequent calls, but each non-negated
+  # frame must be deactivated after each query.
+
+  # As a special case, R_0 = I. We assume I to be a cube, hence its negation is
+  # a single clause.
+
+  checker.add_clause( -I )
+
+  for i in 1 .. k:
+
+    # Add R_i into the solver activated by a temporary activation variable,
+    # which will be permanently set to false after this query.
+
+    act = make_variable()
+
+    for c in F[ i ]:
+      checker.add_clause( ( -c ).activated_by( act ) )
+
+    if not checker.assume( act ).is_sat():
+      return true
+
+    if i < k:
+      checker.add_clause( { -act } )
+      checker.add_formula( clausify_frame_negation( F[ i ] ) )
+
+  return false
+
+
+clausify_frame_negation( cubes : list[ cube ] ) -> cnf_formula:
+
+  # Given a list of cubes c_1, ..., c_n, we want to return the formula
+  # c_1 \/ ... \/ c_n in CNF. We use ordinary Tseitin encoding for this, i.e.
+  # we introduce a new variable x such that x <-> c_1 \/ ... \/ c_n and we
+  # assert x to be true. Note that the equivalence splits as
+  #   1. x -> c_1 \/ ... \/ c_n
+  #   2. c_1 \/ ... \/ c_n -> x
+  # where the first implication is equivalent to -x \/ c_1 \/ ... \/ c_n, and
+  # the second one splits into n implications of the form c_i -> x, each of
+  # them of the particularly simple form -c_i \/ x, which is a single clause.
+  #
+  # However, -x \/ c_1 \/ ... \/ c_n is not a clause (since each c_i is a
+  # conjunction), and as such, we perform additional clausification on this
+  # by introducing variables y_i, each of them equivalent to
+  # c_i = l_1 /\ ... /\ l_m (where each l_j is a literal). This means that
+  #   1. y_i -> l_1 /\ ... /\ l_m
+  #   2. l_1 /\ ... /\ l_m -> y_i
+  # where the first constraint splits as m implications y_i -> l_j, each of
+  # them a clause -y_i \/ l_j, and the second one is equivalent to
+  # -(l_1 /\ ... /\ l_m) \/ y_i = -l_1 \/ ... \/ -l_m \/ y_i, which is a single
+  # clause.
+
+
+  x = make_variable()
+  cnf = cnf_formula()
+
+  cnf.add_clause( { x } )
+
+  # Add the large constraint -x \/ c_1 \/ ... \/ c_n.
+
+  ys = []
+
+  for c in cubes:
+    ys.push_back( make_variable() )
+
+    # Add y_i -> l_j.
+
+    for l in literals( c ):
+      cnf.add_clause( { -ys.last(), l } )
+
+    # Add -l_1 \/ ... \/ -l_m \/ y_i = -c \/ y_i.
+
+    cnf.add_clause( ( -c ).union( ys.last() ) )
+
+  # When all the y's are elaborated on, assert -x \/ y_1 \/ ... \/ y_n.
+
+  cnf.add_clause( { -x, ys[ 0 ], ..., ys[ |cubes| - 1 ] } )
+
+  # Add the clauses -c_i \/ x. However, we now have constraints saying that
+  # c_i <-> y_i, hence we can add shorter clauses -y_i \/ x instead.
+
+  for y in ys:
+    cnf.add_clause( { -y, x } )
+
+  return cnf
+
+
+is_already_blocked( < c, i > : cube * int ) -> bool:
+
+  # Similar to PDR. Again, because of non-cumulativity, we only look at the
+  # cubes blocked at level i.
+
+  assert 1 <= i <= k
+
+  for d in F[ i ]:
+    if subsumes( d, c ):
+      return true
+
+  return not basic_solver.assume( literals( c ), Act[ i ] ).is_sat()
+
+
+add_blocked_at( c : cube, i : int ):
+  assert 1 <= i <= k
+
+  # Similarly to PDR, we want to add c to F[ i ] and assert -c in the solver.
+  # We can also remove subsumed cubes, but only in F[ i ], since the trace is
+  # not cumulative.
+
+  for d in F[ i ]:
+    if subsumes( c, d ):
+      F[ i ].remove( d )
+
+  F[ i ].push_cube( c )
+
+  clause = ( -c ).activated_by( Act[ m ] )
+
+  basic_solver.add_clause( clause )
+  trans_solver.add_clause( clause )
+  error_solver.add_clause( clause )
+
+
+add_reaching_at( c : cube, i : int ):
+  assert 0 <= i
+
+  # We want to add c to B[ i ]. This can also potentially create a new coframe,
+  # hence we first ensure that we have a place to push it to. Similarly to
+  # add_blocked_at, it makes sense here to remove cubes subsumed by c from
+  # B[ i ]. It might be interesting to consider removing subsumed cubes even
+  # from elsewhere in the cotrace and add c not to i, but, say, to B[ j ] where
+  # j is the minimal (or maximal) index such that c subsumed a clause in
+  # B[ j ], but there is no reason to expect that to be in general faster. It
+  # would require careful evaluation.
+
+  while l < i:
+    push_coframe()
+
+  for d in B[ i ]:
+    if subsumes( c, d ):
+      B[ i ].remove( d )
+
+  B[ i ].push_cube( c )
+
+
+subsumes( c : cube, d : cube ) -> bool:
+
+  # Same as in PDR, unsurprisingly.
+
+  if |literals( c )| > |literals( d )|:
+      return false
+
+  for l in literals( c ):
+    if not literals( d ).contains( l ):
+      return false
+
+  return true
+
+
+generalize_predecessor( s : cube ) -> cube:
+
+  # This is almost the same as in PDR, with two important differences. First,
+  # in the so-called "backward" mode (which is implementable by running this
+  # forward CAR on a reversed transition system), the transition relation is
+  # no longer deterministic in the sense that, for a given state t and inputs
+  # i, there is exactly one successor of t under i. Indeed, there might be no
+  # or even many successors. This means that we can no longer assume the SAT
+  # query below returns unsat. The original authors simply don't perform this
+  # generalization in such a case.
+
+  if T_not_functional():
+    return trans_solver.get_model().filter( is_state_variable )
+
+  assert s.all( fun lit => var( lit ).is_state_variable )
+
+  # Note that this function must be called before a different sat call is made.
+
+  ins = trans_solver.get_model().filter( is_input_variable )
+  p = trans_solver.get_model().filter( is_state_variable )
+
+  # We know that T /\ ins /\ p /\ -s' is unsatisfiable, we want to get its
+  # core.
+
+  b = trans_solver.constrain( -s' ).assume( ins, p ).is_sat()
+  assert not b
+
+  # The other important difference is that instead of returning just the core
+  # provided by the solver, we actually try to shrink it further to a minimal
+  # core. The function get_minimal_core receives a seed and the originally
+  # queried formula. Implementation-wise the queried formula is passed around
+  # as a function which, given a list of assumptions a, asserts a instead of
+  # the original part of the formula from which we computed the core seed and
+  # queries the solver.
+
+  core = trans_solver.core().filter( fun lit => var( lit ).is_state_variable )
+
+  thunk = fun ( a ) =>
+    trans_solver.constrain( -s' ).assume( ins, a ).is_sat()
+
+  return get_minimal_core( trans_solver, core, thunk )
+
+
+generalize_blocked( c : cube, i : int ) -> cube:
+  assert 1 <= i <= k
+
+  # The formula R_{i - 1} /\ T /\ c' was found to be unsatisfiable in
+  # solve_obligation. That is, there is no predecessor state of any state of
+  # c in the frame R_{i - 1}. We want to generalize c instead of adding it
+  # to F[ i ] as is. Unlike PDR, which employs a relatively complex scheme
+  # of inductive generalization, we use the same idea as in the predecessor
+  # generalization algorithm above - minimal unsat cores. We simply want to
+  # add a minimal subset d of c that still has no predecessors in R_{i - 1}.
+
+  core = trans_solver.core()
+           .filter( fun lit => var( lit ).is_next_state_variable )
+  thunk = fun ( a ) => trans_solver.assume( Act[ i - 1 ], a ).is_sat()
+
+  # NOTE: SimpleCAR seemingly tries to make the resulting core not intersect
+  #       the initial states? This seems to emulate PDR-style generalization?
+
+  return get_minimal_core( trans_solver, core, thunk )
+          .map( fun lit => lit.unprime() )
+
+
+get_minimal_core( slv : solver, seed : cube, requery : cube -> bool ) -> cube:
+
+  # We made a SAT query, found it to be unsatisfiable and the core returned
+  # from the solver (more specifically, the part of the core which includes the
+  # assumption literals we are interested in) has been given to us as the seed.
+  # The function requery poses the same query to the solver, but with the
+  # original interesting part of the assumption literals replaced by the
+  # provided parameter, which is to be interpreted as a potential smaller core.
+
+  core = seed
+
+  # Note that the following loop goes through a collection which is changing
+  # in its body, which is something that the implementation must handle.
+
+  for l in literals( core ):
+    smaller = core.remove( l )
+
+    if not requery( smaller ):
+
+      # After removing this literal, the query is still not satisfiable, which
+      # means that smaller is an unsat core strictly smaller than the original
+      # one. Furthermore, we can ask the solver about its new unsat core, which
+      # might be even smaller than our 'smaller'.
+
+      core = smaller.filter( fun lit => slv.core().contains( lit ) )
+
+  return core
