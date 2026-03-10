@@ -12,3 +12,7 @@ src_backup
 build
 .vscode
 *.cnf
+*.tmp
+*.log
+*~
+.DS_Store
